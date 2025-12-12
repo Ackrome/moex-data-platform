@@ -1,0 +1,52 @@
+# File: requirements.txt
+
+# Orchestration (ВАЖНО: строго меньше 3.0.0)
+prefect>=2.19.0,<3.0.0
+prefect-client>=2.19.0,<3.0.0
+
+# Data Processing
+dask[complete]>=2023.12.0
+pandas
+numpy
+# pyspark -- УДАЛЕНО (ставим из tgz в Dockerfile)
+
+# Network & API
+requests
+aiohttp
+
+# Validation & Settings
+pydantic>=2.12.0,<3.0.0
+pydantic-settings
+
+# Database & Storage
+sqlalchemy
+psycopg2-binary
+s3fs
+minio
+
+# API & Viz
+fastapi
+uvicorn
+dash-ace>=0.2.1
+plotly>=5.0.0
+dash
+
+# Queue management
+celery>=5.3.0
+redis>=5.0.0
+dash-bootstrap-components>=1.5.0
+dash-extensions>=1.0.0
+websockets    
+
+
+# Dev & Testing
+pytest>=7.0.0
+pytest-asyncio
+ruff>=0.1.0
+httpx
+
+# auth
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+bcrypt==4.0.1  

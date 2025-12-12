@@ -1,0 +1,62 @@
+# File: docker/Dockerfile.etl
+
+FROM python:3.12-slim-bookworm
+
+ARG MIRROR_SITE=http://mirror.truenetwork.ru
+    
+ENV APT_OPTS="-y --no-install-recommends" 
+
+
+# 1. Установка системных зависимостей, Java 17 и procps (нужен для Spark)
+RUN echo 'APT::Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries && \
+    find /etc/apt -name "*.list" -exec sed -i "s|http://deb\.debian\.org|${MIRROR_SITE}|g" {} + || true; \
+    find /etc/apt -name "*.sources" -exec sed -i "s|URIs: http://deb\.debian\.org|URIs: ${MIRROR_SITE}|g" {} + || true; \
+    apt-get update && \
+    mkdir -p /usr/share/man/man1 && \
+    apt-get install $APT_OPTS \
+    openjdk-17-jre-headless \
+    build-essential \
+    libpq-dev \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Настройка JAVA_HOME
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+# 2. Установка Spark из локального файла
+WORKDIR /opt
+
+# Копируем архив из папки predownload (контекст сборки - корень проекта)
+COPY predownload/spark-4.0.1-bin-hadoop3.tgz /tmp/spark.tgz
+
+# Распаковка, перемещение и очистка
+RUN tar -xzf /tmp/spark.tgz -C /opt/ && \
+    mv /opt/spark-4.0.1-bin-hadoop3 /opt/spark && \
+    rm /tmp/spark.tgz
+
+COPY predownload/jars /opt/spark/jars/
+
+
+# 3. Настройка переменных окружения Spark
+ENV SPARK_HOME=/opt/spark
+ENV PATH=$PATH:$SPARK_HOME/bin
+# Переименовываем py4j с версией в фиксированное имя, чтобы прописать в PYTHONPATH
+RUN mv $SPARK_HOME/python/lib/py4j-*-src.zip $SPARK_HOME/python/lib/py4j-combined.zip
+
+# 4. Рабочая директория приложения
+WORKDIR /app
+
+# 5. Установка Python зависимостей (без pyspark, он уже есть в /opt/spark)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 6. Настройка PYTHONPATH
+# Добавляем Spark Python API и Py4J в путь, чтобы скрипты видели модуль pyspark
+ENV PYTHONPATH=$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-combined.zip:/app
+
+# 7. Копируем код проекта
+COPY . .
+
+# Точка входа по умолчанию (переопределяется в docker-compose)
+CMD ["tail", "-f", "/dev/null"]

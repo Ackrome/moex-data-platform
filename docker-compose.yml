@@ -1,0 +1,136 @@
+version: "3.9"
+
+services:
+  # --- Storage Layer ---
+  postgres:
+    image: postgres:15
+    container_name: moex_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      # ВАЖНО: Сохраняем базу в папку проекта ./data/postgres
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 20s
+      timeout: 20s
+      retries: 10
+    networks:
+      - moex_net
+
+  minio:
+    image: minio/minio
+    container_name: moex_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      # ВАЖНО: Сохраняем файлы в папку проекта ./data/minio
+      - ./data/minio:/data
+    networks:
+      - moex_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: moex_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - moex_net
+
+  # --- Compute Layer (Spark 4.0.1 Custom) ---
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.etl
+    image: moex-spark-custom:4.0.1
+    container_name: moex_spark_master
+    hostname: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks:
+      - moex_net
+
+  spark-worker:
+    image: moex-spark-custom:4.0.1
+    container_name: moex_spark_worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_EXECUTOR_MEMORY=1G
+    depends_on:
+      - spark-master
+    networks:
+      - moex_net
+
+  # --- Orchestration Layer ---
+  prefect-server:
+    image: prefecthq/prefect:2-latest
+    container_name: moex_prefect_server
+    command: prefect server start --host 0.0.0.0
+    environment:
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/prefect
+      - PREFECT_row_limit=100
+    ports:
+      - "4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - moex_net
+
+  # --- ETL Runner (App) ---
+  etl-runner:
+    image: moex-spark-custom:4.0.1
+    container_name: moex_etl_runner
+    command: sh -c "./start.sh"
+    environment:
+      - PREFECT_API_URL=${PREFECT_API_URL}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      # Postgres
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=postgres
+      # Celery
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    ports:
+      - "8000:8000"
+      - "8050:8050"
+    volumes:
+      - ./:/app
+    depends_on:
+      - prefect-server
+      - minio
+      - postgres
+      - spark-master
+      - redis
+    networks:
+      - moex_net
+
+networks:
+  moex_net:

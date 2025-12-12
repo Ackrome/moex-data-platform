@@ -1,0 +1,32 @@
+# File: pyproject.toml
+
+[tool.ruff]
+# Настройки линтера (замена flake8 и isort)
+line-length = 120
+target-version = "py310"
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort (сортировка импортов)
+    "B",  # flake8-bugbear (поиск багов)
+    "UP", # pyupgrade (обновление синтаксиса)
+]
+ignore = [
+    "E501", # Игнорируем ошибки длины строки (оставляем soft limit)
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"] # Игнорируем неиспользуемые импорты в init файлах
+
+[tool.pytest.ini_options]
+# Настройки тестов
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
+python_files = "test_*.py"
+pythonpath = [
+    ".", "src"
+]

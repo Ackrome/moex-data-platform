@@ -1,0 +1,2147 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+.gitignore
+debug_moex.py
+docker-compose.yml
+docker/Dockerfile.etl
+docker/init.sql
+downloads.py
+flows/ingest_flow.py
+flows/transform_flow.py
+pyproject.toml
+README.md
+requirements.txt
+src/api/app.py
+src/api/auth.py
+src/config.py
+src/create_tables.py
+src/dashboard/app.py
+src/ingestion/moex.py
+src/processing/spark_job.py
+src/storage/minio_client.py
+src/storage/task_registry.py
+src/worker/tasks.py
+start.sh
+tests/test_injection.py
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path=".gitignore">
+**__pycache__
+
+/predownload
+*.log
+/data
+</file>
+
+<file path="debug_moex.py">
+# File: debug_moex.py
+import requests
+import json
+
+# Тестовые параметры: Сбербанк, 2023 год
+URL = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/SBER/candles.json"
+PARAMS = {
+    "from": "2023-01-01",
+    "till": "2023-01-05",  # Берем всего 5 дней
+    "interval": 24,  # Дневки
+    "start": 0,
+}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+}
+
+print(f"📡 Testing connection to: {URL}")
+try:
+    resp = requests.get(URL, params=PARAMS, headers=HEADERS, timeout=10)
+    print(f"Status Code: {resp.status_code}")
+
+    if resp.status_code == 200:
+        data = resp.json()
+        print("Keys in JSON:", data.keys())
+
+        if "candles" in data:
+            rows = data["candles"]["data"]
+            print(f"Rows received: {len(rows)}")
+            if len(rows) > 0:
+                print("First row sample:", rows[0])
+            else:
+                print("⚠️ Data array is empty!")
+        else:
+            print("❌ Key 'candles' missing in response!")
+            print("Response snippet:", resp.text[:200])
+    else:
+        print("❌ HTTP Error.")
+        print("Response:", resp.text[:500])
+
+except Exception as e:
+    print(f"❌ Exception: {e}")
+</file>
+
+<file path="docker-compose.yml">
+version: "3.9"
+
+services:
+  # --- Storage Layer ---
+  postgres:
+    image: postgres:15
+    container_name: moex_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "5432:5432"
+    volumes:
+      # ВАЖНО: Сохраняем базу в папку проекта ./data/postgres
+      - ./data/postgres:/var/lib/postgresql/data
+      - ./docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 20s
+      timeout: 20s
+      retries: 10
+    networks:
+      - moex_net
+
+  minio:
+    image: minio/minio
+    container_name: moex_minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      # ВАЖНО: Сохраняем файлы в папку проекта ./data/minio
+      - ./data/minio:/data
+    networks:
+      - moex_net
+
+  redis:
+    image: redis:7-alpine
+    container_name: moex_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - moex_net
+
+  # --- Compute Layer (Spark 4.0.1 Custom) ---
+  spark-master:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.etl
+    image: moex-spark-custom:4.0.1
+    container_name: moex_spark_master
+    hostname: spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8080:8080"
+      - "7077:7077"
+    networks:
+      - moex_net
+
+  spark-worker:
+    image: moex-spark-custom:4.0.1
+    container_name: moex_spark_worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_WORKER_MEMORY=3G
+      - SPARK_EXECUTOR_MEMORY=1G
+    depends_on:
+      - spark-master
+    networks:
+      - moex_net
+
+  # --- Orchestration Layer ---
+  prefect-server:
+    image: prefecthq/prefect:2-latest
+    container_name: moex_prefect_server
+    command: prefect server start --host 0.0.0.0
+    environment:
+      - PREFECT_API_DATABASE_CONNECTION_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/prefect
+      - PREFECT_row_limit=100
+    ports:
+      - "4200:4200"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - moex_net
+
+  # --- ETL Runner (App) ---
+  etl-runner:
+    image: moex-spark-custom:4.0.1
+    container_name: moex_etl_runner
+    command: sh -c "./start.sh"
+    environment:
+      - PREFECT_API_URL=${PREFECT_API_URL}
+      - MINIO_ENDPOINT=${MINIO_ENDPOINT}
+      - MINIO_ACCESS_KEY=${MINIO_ROOT_USER}
+      - MINIO_SECRET_KEY=${MINIO_ROOT_PASSWORD}
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      # Postgres
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+      - POSTGRES_HOST=postgres
+      # Celery
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+    ports:
+      - "8000:8000"
+      - "8050:8050"
+    volumes:
+      - ./:/app
+    depends_on:
+      - prefect-server
+      - minio
+      - postgres
+      - spark-master
+      - redis
+    networks:
+      - moex_net
+
+networks:
+  moex_net:
+</file>
+
+<file path="docker/Dockerfile.etl">
+# File: docker/Dockerfile.etl
+
+FROM python:3.12-slim-bookworm
+
+ARG MIRROR_SITE=http://mirror.truenetwork.ru
+    
+ENV APT_OPTS="-y --no-install-recommends" 
+
+
+# 1. Установка системных зависимостей, Java 17 и procps (нужен для Spark)
+RUN echo 'APT::Acquire::Retries "3";' > /etc/apt/apt.conf.d/99retries && \
+    find /etc/apt -name "*.list" -exec sed -i "s|http://deb\.debian\.org|${MIRROR_SITE}|g" {} + || true; \
+    find /etc/apt -name "*.sources" -exec sed -i "s|URIs: http://deb\.debian\.org|URIs: ${MIRROR_SITE}|g" {} + || true; \
+    apt-get update && \
+    mkdir -p /usr/share/man/man1 && \
+    apt-get install $APT_OPTS \
+    openjdk-17-jre-headless \
+    build-essential \
+    libpq-dev \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Настройка JAVA_HOME
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+
+# 2. Установка Spark из локального файла
+WORKDIR /opt
+
+# Копируем архив из папки predownload (контекст сборки - корень проекта)
+COPY predownload/spark-4.0.1-bin-hadoop3.tgz /tmp/spark.tgz
+
+# Распаковка, перемещение и очистка
+RUN tar -xzf /tmp/spark.tgz -C /opt/ && \
+    mv /opt/spark-4.0.1-bin-hadoop3 /opt/spark && \
+    rm /tmp/spark.tgz
+
+COPY predownload/jars /opt/spark/jars/
+
+
+# 3. Настройка переменных окружения Spark
+ENV SPARK_HOME=/opt/spark
+ENV PATH=$PATH:$SPARK_HOME/bin
+# Переименовываем py4j с версией в фиксированное имя, чтобы прописать в PYTHONPATH
+RUN mv $SPARK_HOME/python/lib/py4j-*-src.zip $SPARK_HOME/python/lib/py4j-combined.zip
+
+# 4. Рабочая директория приложения
+WORKDIR /app
+
+# 5. Установка Python зависимостей (без pyspark, он уже есть в /opt/spark)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 6. Настройка PYTHONPATH
+# Добавляем Spark Python API и Py4J в путь, чтобы скрипты видели модуль pyspark
+ENV PYTHONPATH=$SPARK_HOME/python:$SPARK_HOME/python/lib/py4j-combined.zip:/app
+
+# 7. Копируем код проекта
+COPY . .
+
+# Точка входа по умолчанию (переопределяется в docker-compose)
+CMD ["tail", "-f", "/dev/null"]
+</file>
+
+<file path="docker/init.sql">
+-- File: docker/init.sql
+
+CREATE DATABASE prefect;
+
+-- --- AUTH ---
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role VARCHAR(20) NOT NULL DEFAULT 'user',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE user_charts (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER REFERENCES users(id),
+    name VARCHAR(100) NOT NULL,
+    code TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, name)
+);
+
+-- Users
+INSERT INTO users (username, password_hash, role) 
+VALUES ('admin', '$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxwKc.6IymVFt7H.8W0kM.y.uAIiG', 'admin');
+
+INSERT INTO users (username, password_hash, role) 
+VALUES ('user', '$2b$12$EixZaYVK1fsbw1ZfbX3OXePaWxwKc.6IymVFt7H.8W0kM.y.uAIiG', 'user');
+
+-- --- DATA WAREHOUSE (GOLD LAYER) ---
+\c moex_dw
+
+CREATE TABLE IF NOT EXISTS stock_metrics (
+    ticker TEXT NOT NULL,
+    interval TEXT NOT NULL,
+    ts TIMESTAMP WITHOUT TIME ZONE NOT NULL,
+    open DOUBLE PRECISION,
+    high DOUBLE PRECISION,
+    low DOUBLE PRECISION,
+    close DOUBLE PRECISION,
+    volume DOUBLE PRECISION,
+    sma_20 DOUBLE PRECISION,
+    rsi_14 DOUBLE PRECISION,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, interval, ts)
+);
+
+-- Индексы
+CREATE INDEX IF NOT EXISTS idx_ticker_interval ON stock_metrics(ticker, interval);
+CREATE INDEX IF NOT EXISTS idx_ts ON stock_metrics(ts);
+</file>
+
+<file path="downloads.py">
+# File: download_jars.py
+import os
+import requests
+
+# Список JAR-файлов, которые Spark пытался качать в логах
+JARS = [
+    # Hadoop AWS connector
+    "https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.4.0/hadoop-aws-3.4.0.jar",
+    # Postgres Driver
+    "https://repo1.maven.org/maven2/org/postgresql/postgresql/42.6.0/postgresql-42.6.0.jar",
+    # AWS SDK Bundle (самый тяжелый, ~180MB)
+    "https://repo1.maven.org/maven2/software/amazon/awssdk/bundle/2.23.19/bundle-2.23.19.jar",
+    # Dependencies
+    "https://repo1.maven.org/maven2/org/wildfly/openssl/wildfly-openssl/1.1.3.Final/wildfly-openssl-1.1.3.Final.jar",
+    "https://repo1.maven.org/maven2/org/checkerframework/checker-qual/3.31.0/checker-qual-3.31.0.jar",
+]
+
+DEST_DIR_jar = "predownload/jars"
+DEST_DIR_spark = "predownload"
+
+
+def download_file(DEST_DIR, url):
+    local_filename = url.split("/")[-1]
+    path = os.path.join(DEST_DIR, local_filename)
+
+    if os.path.exists(path):
+        print(f"\n⏩ {local_filename} already exists.")
+        return
+
+    print(f"\n⬇️ Downloading {local_filename}...")
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    print(f"✅ Saved to {path}")
+
+
+if __name__ == "__main__":
+    os.makedirs(DEST_DIR_jar, exist_ok=True)
+    print("🚀 Starting JAR download...")
+    for url in JARS:
+        download_file(DEST_DIR_jar, url)
+    print("🏁 All JARs downloaded.\n")
+
+    os.makedirs(DEST_DIR_spark, exist_ok=True)
+    print("🚀 Starting SPARK download...")
+    download_file(DEST_DIR_spark, "https://dlcdn.apache.org/spark/spark-4.0.1/spark-4.0.1-bin-hadoop3.tgz")
+    print("🏁 ALL FILES DOWNLOADED")
+</file>
+
+<file path="flows/ingest_flow.py">
+# File: flows/ingest_flow.py
+from prefect import flow, task
+import dask
+from dask.diagnostics import Callback
+from datetime import datetime
+from src.ingestion.moex import process_ticker_year
+from src.storage.task_registry import task_registry
+
+# --- Custom Dask Callback (RedisProgressBar) ---
+class RedisProgressBar(Callback):
+    def __init__(self, task_id: str, start_pct: int = 10, end_pct: int = 70):
+        super().__init__()
+        self.task_id = task_id
+        self.start_pct = start_pct
+        self.end_pct = end_pct
+        self.range = end_pct - start_pct
+
+    def _start_state(self, dsk, state):
+        self._state = state
+
+    def _posttask(self, key, result, dsk, state, worker_id):
+        s = state
+        ndone = len(s["finished"])
+        ntasks = len(s["finished"]) + len(s["ready"]) + len(s["waiting"]) + len(s["running"])
+        if ntasks > 0:
+            relative_progress = ndone / ntasks
+            total_progress = int(self.start_pct + (relative_progress * self.range))
+            task_registry.update_task(
+                self.task_id, 
+                progress=total_progress,
+                status=f"🌍 Loading: {ndone}/{ntasks} chunks..."
+            )
+    def _finish(self, dsk, state, errored): pass
+
+# --- Updated Generator ---
+
+@task(name="Generate Tasks")
+def generate_download_tasks(tickers: list, years_back: int = 5):
+    current_year = datetime.now().year
+    start_year = current_year - years_back
+    years = range(start_year, current_year + 1)
+    
+    tasks = []
+    
+    for ticker in tickers:
+        t = ticker.upper().strip()
+        is_index = (t == 'IMOEX')
+        
+        for year in years:
+            # 1. ДНЕВКИ (1d): Качаем сразу год (один файл)
+            # month=None
+            tasks.append(process_ticker_year(t, year, 24, None, is_index))
+            
+            # 2. МИНУТКИ (1m): Качаем ТОЛЬКО последние 2 года, чтобы не сойти с ума
+            # И разбиваем каждый год на 12 месяцев
+            # if year >= current_year - 1:
+            for month in range(1, 13):
+                # Если месяц в будущем (например, сейчас март, а мы просим декабрь), 
+                # скрипт вернет EMPTY, это нормально.
+                if year == current_year and month > datetime.now().month:
+                    continue
+                    
+                tasks.append(process_ticker_year(t, year, 1, month, is_index))
+                    
+    return tasks
+
+@flow(name="MOEX Ingestion Bronze")
+def ingest_flow(tickers: list, years_back: int, task_id: str = None):
+    print(f"🚀 Starting Ingestion for: {tickers}")
+    
+    lazy_results = generate_download_tasks(tickers, years_back)
+    
+    if not lazy_results:
+        print("⚠️ No tasks generated.")
+        return
+
+    print(f"📦 Created {len(lazy_results)} lazy tasks.")
+    
+    # Используем больше потоков, так как задачи стали меньше
+    num_workers = 12 
+    
+    if task_id:
+        with RedisProgressBar(task_id, start_pct=10, end_pct=70):
+            results = dask.compute(*lazy_results, scheduler='threads', num_workers=num_workers)
+    else:
+        results = dask.compute(*lazy_results, scheduler='threads', num_workers=num_workers)
+    
+    success_cnt = sum(1 for r in results if "SUCCESS" in r)
+    print(f"🏁 Flow finished. Processed: {len(results)}. Saved: {success_cnt}.")
+
+if __name__ == "__main__":
+    ingest_flow(['SBER'], 1)
+</file>
+
+<file path="flows/transform_flow.py">
+# File: flows/transform_flow.py
+from prefect import flow, task
+from src.processing.spark_job import process_data
+from typing import List
+
+@task(name="Run PySpark Job")
+def run_spark_job(tickers: List[str] = None):
+    # Теперь мы передаем конкретный список тикеров
+    # Это позволяет Spark обрабатывать только их, не блокируя всю базу
+    process_data(tickers)
+
+@flow(name="MOEX Transformation Bronze-Gold")
+def transform_flow(tickers: List[str] = None):
+    print(f"🔥 Starting Spark ETL for: {tickers or 'ALL'}")
+    run_spark_job(tickers)
+
+if __name__ == "__main__":
+    transform_flow(["SBER"])
+</file>
+
+<file path="pyproject.toml">
+# File: pyproject.toml
+
+[tool.ruff]
+# Настройки линтера (замена flake8 и isort)
+line-length = 120
+target-version = "py310"
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort (сортировка импортов)
+    "B",  # flake8-bugbear (поиск багов)
+    "UP", # pyupgrade (обновление синтаксиса)
+]
+ignore = [
+    "E501", # Игнорируем ошибки длины строки (оставляем soft limit)
+]
+
+[tool.ruff.per-file-ignores]
+"__init__.py" = ["F401"] # Игнорируем неиспользуемые импорты в init файлах
+
+[tool.pytest.ini_options]
+# Настройки тестов
+minversion = "7.0"
+addopts = "-ra -q"
+testpaths = [
+    "tests",
+]
+python_files = "test_*.py"
+pythonpath = [
+    ".", "src"
+]
+</file>
+
+<file path="README.md">
+# MOEX Enterprise Data Platform 📈
+
+End-to-End платформа для сбора, обработки и визуализации биржевых данных Московской Биржи (MOEX).
+Проект реализует **Lambda Architecture** с использованием современных Big Data инструментов.
+
+## 🏗 Архитектура
+
+Проект построен на принципах **Clean Architecture** и **Medallion Architecture** (Bronze -> Silver -> Gold).
+
+### Технологический стек:
+1.  **Ingestion Layer (Extract):**
+    *   **Dask:** Параллельный асинхронный скрейпинг API Мосбиржи. Выбран за эффективность в IO-bound задачах.
+    *   **Prefect:** Оркестрация потоков данных и управление зависимостями.
+2.  **Storage Layer (Data Lake):**
+    *   **MinIO (S3):** Хранение сырых данных (Bronze Layer) в формате JSON.
+    *   **PostgreSQL:** Хранение обработанных витрин данных (Gold Layer) для быстрого доступа.
+3.  **Processing Layer (Transform):**
+    *   **Apache Spark (PySpark):** Очистка данных, приведение типов, расчет технических индикаторов (SMA, RSI). Используется Window Functions для высокой производительности.
+4.  **Serving & Visualization:**
+    *   **FastAPI:** REST API (Backend-for-Frontend) для отвязки данных от интерфейса.
+    *   **Plotly Dash:** Интерактивный веб-интерфейс для финансового анализа.
+5.  **Infrastructure:**
+    *   **Docker & Docker Compose:** Полная изоляция среды.
+
+## 🚀 Запуск
+
+Для запуска требуется только Docker.
+
+1. **Сборка и запуск:**
+   ```bash
+   docker-compose up -d --build
+   ```
+
+2. **Доступ к интерфейсам:**
+   *   📊 **Dashboard:** [http://localhost:8050](http://localhost:8050)
+   *   ⚙️ **API Docs:** [http://localhost:8000/docs](http://localhost:8000/docs)
+   *   🗄️ **MinIO Console:** [http://localhost:9001](http://localhost:9001) (User/Pass: `minioadmin`)
+   *   ⚡ **Spark Master:** [http://localhost:8080](http://localhost:8080)
+   *   🌪️ **Prefect UI:** [http://localhost:4200](http://localhost:4200)
+
+## 🔄 Пайплайн данных
+
+1.  **Ingestion:** Запускается Flow в Prefect, который через Dask выкачивает исторические свечи (1min, 1day) и сохраняет в S3 (`raw-data`).
+2.  **Transformation:** Spark Job читает S3, формирует схему, рассчитывает индикаторы и пишет в PostgreSQL (`stock_metrics`).
+3.  **Visualization:** Dash запрашивает данные через API и строит Candlestick Chart + Volume + RSI.
+
+## 📂 Структура проекта
+
+*   `flows/` - Сценарии оркестрации Prefect.
+*   `src/ingestion/` - Логика загрузки данных (Dask).
+*   `src/processing/` - Логика обработки данных (Spark).
+*   `src/api/` - Сервер FastAPI.
+*   `src/dashboard/` - Интерфейс Dash.
+*   `docker/` - Конфигурация образов.
+</file>
+
+<file path="requirements.txt">
+# File: requirements.txt
+
+# Orchestration (ВАЖНО: строго меньше 3.0.0)
+prefect>=2.19.0,<3.0.0
+prefect-client>=2.19.0,<3.0.0
+
+# Data Processing
+dask[complete]>=2023.12.0
+pandas
+numpy
+# pyspark -- УДАЛЕНО (ставим из tgz в Dockerfile)
+
+# Network & API
+requests
+aiohttp
+
+# Validation & Settings
+pydantic>=2.12.0,<3.0.0
+pydantic-settings
+
+# Database & Storage
+sqlalchemy
+psycopg2-binary
+s3fs
+minio
+
+# API & Viz
+fastapi
+uvicorn
+dash-ace>=0.2.1
+plotly>=5.0.0
+dash
+
+# Queue management
+celery>=5.3.0
+redis>=5.0.0
+dash-bootstrap-components>=1.5.0
+dash-extensions>=1.0.0
+websockets    
+
+
+# Dev & Testing
+pytest>=7.0.0
+pytest-asyncio
+ruff>=0.1.0
+httpx
+
+# auth
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+bcrypt==4.0.1
+</file>
+
+<file path="src/api/app.py">
+# File: src/api/app.py
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel
+from typing import List, Optional, Dict
+from datetime import datetime
+import asyncio
+import json
+import psycopg2
+from psycopg2.extras import RealDictCursor
+
+from src.config import settings
+from src.storage.task_registry import task_registry
+from src.worker.tasks import run_etl_task, celery_app
+from src.storage.minio_client import minio_client
+from src.api.auth import (
+    Token, User, verify_password, create_access_token, 
+    get_current_user, get_current_admin, get_password_hash # <--- Добавили импорт хеширования
+)
+
+app = FastAPI(title="MOEX Enterprise Analytics API")
+
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True, 
+    allow_methods=["*"], allow_headers=["*"]
+)
+
+# --- Models ---
+class StockMetric(BaseModel):
+    ticker: str
+    interval: str
+    ts: datetime
+    open: float
+    close: float
+    high: float
+    low: float
+    volume: float
+    sma_20: Optional[float]
+    rsi_14: Optional[float]
+
+class IngestRequest(BaseModel):
+    tickers: List[str]
+    years_back: int = 3
+
+class ChartModel(BaseModel):
+    name: str
+    code: str
+
+class ChartResponse(BaseModel):
+    id: int
+    name: str
+    code: str
+
+# НОВАЯ МОДЕЛЬ
+class UserCreate(BaseModel):
+    username: str
+    password: str
+
+# --- Database ---
+def get_db_connection():
+    return psycopg2.connect(
+        host=settings.POSTGRES_HOST, port=settings.POSTGRES_PORT,
+        user=settings.POSTGRES_USER, password=settings.POSTGRES_PASSWORD,
+        dbname=settings.POSTGRES_DB
+    )
+
+# --- AUTH ROUTES ---
+
+@app.post("/register", status_code=201)
+def register_user(user: UserCreate):
+    """Регистрация нового пользователя (всегда role='user')"""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Проверка на существование
+            cur.execute("SELECT id FROM users WHERE username = %s", (user.username,))
+            if cur.fetchone():
+                raise HTTPException(status_code=400, detail="Username already registered")
+            
+            # Хеширование и вставка
+            hashed_pw = get_password_hash(user.password)
+            cur.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'user')",
+                (user.username, hashed_pw)
+            )
+            conn.commit()
+        return {"status": "created", "username": user.username}
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        print(f"Registration error: {e}")
+        raise HTTPException(status_code=500, detail="Registration failed")
+    finally:
+        conn.close()
+
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    conn = get_db_connection()
+    user = None
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM users WHERE username = %s", (form_data.username,))
+            user = cur.fetchone()
+    finally:
+        conn.close()
+
+    if not user or not verify_password(form_data.password, user['password_hash']):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    access_token = create_access_token(data={"sub": user['username'], "role": user['role']})
+    return {"access_token": access_token, "token_type": "bearer", "role": user['role'], "username": user['username']}
+
+# --- USER CHART ROUTES ---
+@app.post("/charts", response_model=Dict[str, str])
+def save_chart(chart: ChartModel, current_user: User = Depends(get_current_user)):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE username = %s", (current_user.username,))
+            user_id = cur.fetchone()[0]
+            query = """
+                INSERT INTO user_charts (user_id, name, code) VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, name) DO UPDATE SET code = EXCLUDED.code
+            """
+            cur.execute(query, (user_id, chart.name, chart.code))
+            conn.commit()
+        return {"status": "saved", "name": chart.name}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
+@app.get("/charts", response_model=List[ChartResponse])
+def get_my_charts(current_user: User = Depends(get_current_user)):
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT uc.id, uc.name, uc.code 
+                FROM user_charts uc 
+                JOIN users u ON uc.user_id = u.id 
+                WHERE u.username = %s
+                ORDER BY uc.created_at DESC
+            """, (current_user.username,))
+            return cur.fetchall()
+    finally:
+        conn.close()
+
+# --- PUBLIC/PROTECTED DATA ENDPOINTS ---
+@app.get("/tickers", response_model=List[str])
+def get_tickers():
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            # Проверяем существование таблицы
+            cur.execute("SELECT to_regclass('public.stock_metrics')")
+            if cur.fetchone()[0] is None:
+                return []
+            
+            # Читаем тикеры. 
+            # Внимание: если транзакция в Spark идет прямо сейчас, этот запрос подождет COMMIT.
+            # Это хорошо! Мы не получим неполные данные.
+            cur.execute("SELECT DISTINCT ticker FROM stock_metrics ORDER BY ticker")
+            res = [r[0] for r in cur.fetchall()]
+            return res
+    except Exception as e:
+        print(f"⚠️ API Error getting tickers: {e}")
+        return []
+    finally:
+        conn.close()
+
+@app.get("/availability/{ticker}")
+def check_availability(ticker: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT DISTINCT interval FROM stock_metrics WHERE ticker = %s", (ticker.upper(),))
+            existing = {r[0] for r in cur.fetchall()}
+            return {"1d": "1d" in existing, "1m": "1m" in existing}
+    except: return {"1d": False, "1m": False}
+    finally: conn.close()
+
+@app.get("/metrics/{ticker}", response_model=List[StockMetric])
+def get_metrics(ticker: str, limit: int = 5000, interval: str = "1d"):
+    conn = get_db_connection()
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            query = """
+                SELECT * FROM (
+                    SELECT ticker, interval, ts, open, high, low, close, volume, sma_20, rsi_14
+                    FROM stock_metrics
+                    WHERE ticker = %s AND interval = %s
+                    ORDER BY ts DESC LIMIT %s
+                ) sub ORDER BY ts ASC
+            """
+            cur.execute(query, (ticker.upper(), interval, limit))
+            return cur.fetchall() or []
+    except: return []
+    finally: conn.close()
+
+# --- ADMIN ENDPOINTS ---
+@app.post("/etl/run")
+def trigger_etl(request: IngestRequest, admin: User = Depends(get_current_admin)):
+    task = run_etl_task.delay(request.tickers, request.years_back)
+    task_registry.add_task(task.id, ", ".join(request.tickers))
+    task_registry.update_task(task.id, status="⏳ Queued...", progress=0, state="PENDING")
+    return {"task_id": task.id}
+
+@app.post("/etl/cancel/{task_id}")
+def cancel_etl(task_id: str, admin: User = Depends(get_current_admin)):
+    celery_app.control.revoke(task_id, terminate=True)
+    task_registry.update_task(task_id, status="⛔ Cancelled", state="REVOKED", progress=100)
+    return {"status": "cancelled"}
+
+@app.post("/etl/resync")
+def resync_data(admin: User = Depends(get_current_admin)):
+    # 1. Сначала идем в MinIO и смотрим, какие тикеры там РЕАЛЬНО есть
+    tickers = minio_client.list_downloaded_tickers()
+    
+    if not tickers: 
+        return {"status": "error", "detail": "No data in MinIO to resync"}
+    
+    # 2. Запускаем задачу. 
+    # ВАЖНО: Мы передаем СПИСОК тикеров, а не None. 
+    # Это значит, что Spark удалит только их, а не сделает DELETE ALL.
+    task = run_etl_task.delay(tickers, 3)
+    
+    task_registry.add_task(task.id, f"RESYNC: {len(tickers)} tickers")
+    task_registry.update_task(task.id, status=f"♻️ Queued {len(tickers)} tickers", progress=0, state="PENDING")
+    
+    return {"task_id": task.id, "tickers_count": len(tickers)}
+# --- WebSocket ---
+@app.websocket("/ws/tasks")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    try:
+        while True:
+            tasks = task_registry.get_all_tasks()
+            await websocket.send_json(tasks)
+            await asyncio.sleep(0.5)
+    except: pass
+
+# File: src/api/app.py (Добавь этот кусок)
+
+@app.get("/tasks")
+def get_tasks_list():
+    """Возвращает список всех задач из Redis"""
+    return task_registry.get_all_tasks()
+</file>
+
+<file path="src/api/auth.py">
+# File: src/api/auth.py
+from datetime import datetime, timedelta
+from typing import Optional
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from pydantic import BaseModel
+
+SECRET_KEY = "super_secret_moex_key_change_me_in_prod"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+class User(BaseModel):
+    username: str
+    role: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+    role: str
+    username: str
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        role: str = payload.get("role")
+        if username is None:
+            raise credentials_exception
+        return User(username=username, role=role)
+    except JWTError:
+        raise credentials_exception
+
+async def get_current_admin(user: User = Depends(get_current_user)):
+    if user.role != "admin":
+        raise HTTPException(status_code=403, detail="Not enough permissions (Admin only)")
+    return user
+</file>
+
+<file path="src/config.py">
+# File: src/config.py
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
+
+class Settings(BaseSettings):
+    # MinIO
+    MINIO_ENDPOINT: str = Field(..., alias="MINIO_ENDPOINT")
+    MINIO_ACCESS_KEY: str = Field(..., alias="MINIO_ROOT_USER")
+    MINIO_SECRET_KEY: str = Field(..., alias="MINIO_ROOT_PASSWORD")
+    
+    MINIO_BUCKET_RAW: str = "raw-data"       # Bronze
+    MINIO_BUCKET_SILVER: str = "silver-data" # New! Silver Layer (Parquet)
+    
+    # Postgres
+    POSTGRES_USER: str = Field("admin", alias="POSTGRES_USER")
+    POSTGRES_PASSWORD: str = Field("adminpass", alias="POSTGRES_PASSWORD")
+    POSTGRES_DB: str = Field("moex_dw", alias="POSTGRES_DB")
+    POSTGRES_HOST: str = Field("postgres", alias="POSTGRES_HOST")
+    POSTGRES_PORT: int = 5432
+
+    # Spark
+    SPARK_MASTER_URL: str = Field("spark://spark-master:7077", alias="SPARK_MASTER_URL")
+
+    # Pydantic V2 Config
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+settings = Settings()
+</file>
+
+<file path="src/create_tables.py">
+# File: src/create_tables.py
+import psycopg2
+from src.config import settings
+from passlib.context import CryptContext
+
+# Настройка хеширования
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def run_migration():
+    print(f"🔌 Connecting to DB at {settings.POSTGRES_HOST}...")
+    try:
+        conn = psycopg2.connect(
+            host=settings.POSTGRES_HOST,
+            port=settings.POSTGRES_PORT,
+            user=settings.POSTGRES_USER,
+            password=settings.POSTGRES_PASSWORD,
+            dbname=settings.POSTGRES_DB
+        )
+        cur = conn.cursor()
+        
+        # 1. УДАЛЕНИЕ СТАРЫХ ТАБЛИЦ (Hard Reset)
+        print("🗑️ Dropping old tables...")
+        # Сначала удаляем charts, так как она зависит от users
+        cur.execute("DROP TABLE IF EXISTS user_charts CASCADE;")
+        cur.execute("DROP TABLE IF EXISTS users CASCADE;")
+        
+        # 2. СОЗДАНИЕ ТАБЛИЦ
+        print("🛠 Creating new tables...")
+        cur.execute("""
+            CREATE TABLE users (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(50) UNIQUE NOT NULL,
+                password_hash VARCHAR(255) NOT NULL,
+                role VARCHAR(20) NOT NULL DEFAULT 'user',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        
+        cur.execute("""
+            CREATE TABLE user_charts (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id),
+                name VARCHAR(100) NOT NULL,
+                code TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, name)
+            );
+        """)
+        
+        # 3. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЕЙ
+        print("👤 Creating users...")
+        # Генерируем хеши "здесь и сейчас", чтобы они точно работали
+        admin_hash = get_password_hash("admin")
+        user_hash = get_password_hash("user")
+        
+        cur.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'admin')",
+            ('admin', admin_hash)
+        )
+        cur.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, 'user')",
+            ('user', user_hash)
+        )
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("✅ DATABASE RESET SUCCESSFUL! (Users 'admin' and 'user' created)")
+        
+    except Exception as e:
+        print(f"❌ Migration FAILED: {e}")
+
+if __name__ == "__main__":
+    run_migration()
+</file>
+
+<file path="src/dashboard/app.py">
+# File: src/dashboard/app.py
+import logging
+import requests
+import pandas as pd
+import json
+import traceback
+import textwrap
+from dash import Dash, dcc, html, Input, Output, State, ALL, callback_context, no_update
+import dash_bootstrap_components as dbc
+from dash_extensions import WebSocket # <--- ВЕРНУЛИ
+import dash_ace
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+
+# --- CONFIG ---
+API_URL = "http://127.0.0.1:8000"
+WS_URL = "ws://127.0.0.1:8000/ws/tasks" # URL для вебсокета
+
+import werkzeug
+werkzeug_log = logging.getLogger('werkzeug')
+werkzeug_log.setLevel(logging.ERROR)
+werkzeug_log.disabled = True
+
+# --- PRESETS ---
+PRESETS = {
+    "simple": {
+        "label": "Simple: Price Line & SMA",
+        "code": textwrap.dedent("""
+        def custom_plot(df):
+            import plotly.graph_objects as go
+            import plotly.express as px
+            fig = px.line(df, x='ts', y=['close', 'sma_20'], 
+                          title='Price vs SMA-20',
+                          template='plotly_dark')
+            return fig
+        """).strip()
+    },
+    "feature_eng": {
+        "label": "Advanced: Feature Engineering",
+        "code": textwrap.dedent("""
+        def custom_plot(df):
+            import plotly.graph_objects as go
+            import plotly.express as px
+            df['volatility'] = df['high'] - df['low']
+            df['price_change'] = df['close'].pct_change() * 100
+            fig = px.histogram(
+                df, x="price_change", nbins=50,
+                title="Distribution of Daily Price Changes (%)",
+                template="plotly_dark",
+                color_discrete_sequence=['#ff9800']
+            )
+            return fig
+        """).strip()
+    }
+}
+
+app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], suppress_callback_exceptions=True)
+
+# --- HELPER ---
+def get_auth_header(token_store):
+    if not token_store: return {}
+    return {"Authorization": f"Bearer {token_store['access_token']}"}
+
+def fetch_tickers():
+    try:
+        resp = requests.get(f"{API_URL}/tickers", timeout=1)
+        return resp.json() if resp.status_code == 200 else []
+    except:
+        return []
+
+# --- LAYOUTS ---
+def login_layout():
+    return dbc.Container([
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("🔐 MOEX Analytics Platform", className="text-center fw-bold"),
+                    dbc.CardBody([
+                        dbc.Tabs([
+                            dbc.Tab([
+                                html.Div([
+                                    dbc.Input(id="login-username", placeholder="Username", type="text", className="mb-3 mt-3"),
+                                    dbc.Input(id="login-password", placeholder="Password", type="password", className="mb-3"),
+                                    dbc.Button("Login", id="login-btn", color="primary", className="w-100"),
+                                    html.Div(id="login-error", className="text-danger mt-3 text-center small")
+                                ])
+                            ], label="Login"),
+                            dbc.Tab([
+                                html.Div([
+                                    dbc.Input(id="reg-username", placeholder="New Username", type="text", className="mb-3 mt-3"),
+                                    dbc.Input(id="reg-password", placeholder="Password", type="password", className="mb-3"),
+                                    dbc.Button("Create Account", id="reg-btn", color="success", className="w-100"),
+                                    html.Div(id="reg-error", className="text-info mt-3 text-center small")
+                                ])
+                            ], label="Register"),
+                        ])
+                    ])
+                ], className="shadow-lg border-secondary bg-dark")
+            ], width=12, md=4)
+        ], className="justify-content-center align-items-center vh-100")
+    ], fluid=True)
+
+def dashboard_layout(username, role):
+    is_admin = (role == 'admin')
+    
+    if is_admin:
+        etl_content = dbc.Card([
+            dbc.CardHeader([
+                dbc.Row([
+                    dbc.Col("⚡ Data Ingestion Pipeline", width=8, className="pt-1 fw-bold"),
+                    dbc.Col(
+                        dbc.Button("Hide Details", id="collapse-btn", color="link", size="sm", className="text-white text-decoration-none"),
+                        width=4, className="text-end"
+                    )
+                ])
+            ], className="bg-transparent border-bottom border-secondary"),
+            dbc.CardBody([
+                dbc.InputGroup([
+                    dbc.Input(id='new-ticker-input', placeholder="Enter Ticker (e.g. SBER)", type="text"),
+                    dbc.Button("Queue Task", id='etl-btn', color="primary")
+                ]),
+                dbc.Button("♻️ Restore / Resync All", id='restore-btn', color="warning", outline=True, size="sm", className="mt-3 w-100"),
+                
+                # Сюда будут падать задачи
+                dbc.Collapse(html.Div(id='task-queue-container', className="mt-3"), id="task-collapse", is_open=True)
+            ])
+        ], className="h-100 shadow-sm border-secondary")
+    else:
+        etl_content = dbc.Card([
+             dbc.CardBody([
+                 html.H5("🔒 Access Restricted", className="text-center text-muted mt-4"),
+                 html.P("Data Ingestion is available for Administrators only.", className="text-center text-muted")
+             ])
+        ], className="h-100 border-secondary")
+
+    return dbc.Container([
+        # ВЕРНУЛИ WebSocket (только здесь, внутри dashboard)
+        WebSocket(id="ws", url=WS_URL),
+        
+        dcc.Store(id='task-store', data=[]),
+        dcc.Store(id='sandbox-data-store'), 
+        dcc.Download(id="download-raw-csv"),
+        dcc.Download(id="download-sandbox-csv"),
+
+        dbc.Row([
+            dbc.Col(html.H2("MOEX Enterprise Analytics Platform", className="text-light fw-bold"), width=8),
+            dbc.Col(html.Div([
+                html.Span(f"👤 {username} ", className="me-2 text-info fw-bold"),
+                html.Span(f"[{role}]", className="me-3 text-muted small"),
+                dbc.Button("Logout", id="logout-btn", color="danger", size="sm", outline=True)
+            ], className="text-end mt-2"), width=4)
+        ], className="my-4"),
+
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader("📉 Visualization Control", className="fw-bold"),
+                    dbc.CardBody([
+                        html.Label("Select Asset:", className="text-muted small"),
+                        dcc.Dropdown(id='ticker-dropdown', placeholder="Choose ticker...", className="text-dark mb-2"),
+                        dbc.Row([
+                            dbc.Col(dbc.RadioItems(id="interval-selector", options=[{"label": "Daily", "value": "1d"}, {"label": "Minute", "value": "1m"}], value="1d", inline=True, className="text-light mt-1"), width=7),
+                            dbc.Col(dbc.Button("Download Raw CSV", id="btn-download-raw", color="success", size="sm", outline=True, className="w-100"), width=5)
+                        ]),
+                        dbc.Button("🔄 Refresh List", id='refresh-btn', color="secondary", size="sm", className="w-100 mt-2")
+                    ])
+                ], className="h-100 border-secondary")
+            ], width=12, md=4),
+            dbc.Col(etl_content, width=12, md=8)
+        ], className="mb-4 g-4"),
+
+        # ... остальной код (графики, песочница) без изменений ...
+        dbc.Row([dbc.Col([dbc.Card([dbc.CardBody(dcc.Loading(id="loading-main", type="circle", children=dcc.Graph(id='main-chart', style={'height': '60vh'})))], className="border-secondary bg-dark shadow")], width=12)], className="mb-5"),
+        dbc.Row([dbc.Col(html.Hr(className="text-secondary"), width=12), dbc.Col(html.H3("🛠 Custom Analytics Sandbox", className="text-center text-info mb-4"), width=12)]),
+        dbc.Row([
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader([
+                        dbc.Row([
+                            dbc.Col("Code Editor", width=4, className="pt-1 fw-bold"),
+                            dbc.Col(dcc.Dropdown(
+                                id='preset-dropdown', 
+                                options=[{'label': v['label'], 'value': k} for k, v in PRESETS.items()], # <--- ДОБАВИЛИ ЭТУ СТРОКУ
+                                placeholder="Load Example...", 
+                                className="text-dark", 
+                                style={'fontSize': '12px'}
+                            ), width=4),
+                            dbc.Col(dcc.Dropdown(id='my-charts-dropdown', placeholder="My Saved Charts...", className="text-dark", style={'fontSize': '12px'}), width=4)
+                        ])
+                    ], className="bg-secondary text-white"),
+                    dbc.CardBody([
+                        dash_ace.DashAceEditor(id='code-editor', value=PRESETS['simple']['code'], theme='monokai', mode='python', height='450px'),
+                        dbc.InputGroup([
+                            dbc.Input(id="save-chart-name", placeholder="Chart Name..."),
+                            dbc.Button("💾 Save", id="save-chart-btn", color="success"),
+                            dbc.Button("▶ Run Analysis", id='run-code-btn', color="primary")
+                        ], className="mt-2")
+                    ], className="p-0")
+                ], className="h-100 border-secondary")
+            ], width=12, lg=5, className="mb-3"),
+            dbc.Col([
+                dbc.Card([
+                    dbc.CardHeader([
+                        dbc.Row([
+                            dbc.Col([html.Span("Result", className="fw-bold me-2"), html.Span(id="dataset-info", className="badge bg-info text-dark")], width=8, className="pt-1"),
+                            dbc.Col(dbc.Button("💾 Download Result", id="btn-download-sandbox", color="light", size="sm", className="w-100"), width=4)
+                        ])
+                    ], className="bg-secondary text-white"),
+                    dbc.CardBody([dcc.Loading(type="cube", children=[html.Div(id='code-error-output'), dcc.Graph(id='custom-chart', style={'height': '400px'}), html.Div(id='data-preview', className="mt-2 small text-muted font-monospace")])])
+                ], className="h-100 border-secondary")
+            ], width=12, lg=7, className="mb-3")
+        ], className="mb-5 pb-5 g-4")
+    ], fluid=True)
+
+# --- APP ---
+app.layout = html.Div([
+    dcc.Location(id='url', refresh=False),
+    dcc.Store(id='auth-token', storage_type='local'),
+    html.Div(id='page-content')
+])
+
+# --- CALLBACKS ---
+
+# 1. LOGIN / LOGOUT / REGISTER
+@app.callback([Output('auth-token', 'data'), Output('login-error', 'children')], [Input('login-btn', 'n_clicks')], [State('login-username', 'value'), State('login-password', 'value')], prevent_initial_call=True)
+def login(n, username, password):
+    if not username or not password: return no_update, "Enter credentials"
+    try:
+        resp = requests.post(f"{API_URL}/token", data={"username": username, "password": password})
+        if resp.status_code == 200: return resp.json(), ""
+        else: return None, "Invalid username or password"
+    except: return None, "Server error (Check API)"
+
+@app.callback(Output('reg-error', 'children'), [Input('reg-btn', 'n_clicks')], [State('reg-username', 'value'), State('reg-password', 'value')], prevent_initial_call=True)
+def register(n, username, password):
+    if not username or not password: return "Fill all fields"
+    try:
+        resp = requests.post(f"{API_URL}/register", json={"username": username, "password": password})
+        if resp.status_code == 201: return "✅ Success! Please switch to Login tab."
+        elif resp.status_code == 400: return "⚠️ Username already taken"
+        else: return "❌ Error occurred"
+    except: return "Server error"
+
+@app.callback(Output('auth-token', 'clear_data'), Input('logout-btn', 'n_clicks'), prevent_initial_call=True)
+def logout_action(n):
+    if n: return True
+    return no_update
+
+@app.callback([Output('page-content', 'children'), Output('url', 'pathname')], [Input('url', 'pathname'), Input('auth-token', 'data')])
+def router(pathname, token_data):
+    is_authenticated = token_data and 'access_token' in token_data
+    if pathname == '/login':
+        if is_authenticated: return dashboard_layout(token_data['username'], token_data['role']), '/'
+        else: return login_layout(), no_update
+    if is_authenticated: return dashboard_layout(token_data['username'], token_data['role']), no_update
+    else: return login_layout(), '/login'
+
+# 2. ETL CONTROLS & WEBSOCKET
+@app.callback([Output("task-collapse", "is_open"), Output("collapse-btn", "children")], [Input("collapse-btn", "n_clicks")], [State("task-collapse", "is_open")], prevent_initial_call=True)
+def toggle_collapse(n, is_open):
+    if n: return not is_open, "Show Details" if is_open else "Hide Details"
+    return is_open, "Hide Details"
+
+@app.callback(Output('new-ticker-input', 'value'), Input('etl-btn', 'n_clicks'), [State('new-ticker-input', 'value'), State('auth-token', 'data')], prevent_initial_call=True)
+def queue_task(n, t, token):
+    if t and token: requests.post(f"{API_URL}/etl/run", json={"tickers": [t.upper().strip()]}, headers=get_auth_header(token))
+    return ""
+
+@app.callback(Output('new-ticker-input', 'placeholder'), Input('restore-btn', 'n_clicks'), State('auth-token', 'data'), prevent_initial_call=True)
+def restore_db(n, token):
+    if n and token: requests.post(f"{API_URL}/etl/resync", headers=get_auth_header(token))
+    return no_update
+
+@app.callback(Output('task-queue-container', 'className'), Input({'type': 'cancel-btn', 'index': ALL}, 'n_clicks'), State('auth-token', 'data'), prevent_initial_call=True)
+def cancel_task(n, token):
+    ctx = callback_context
+    if ctx.triggered and ctx.triggered[0]['value'] and token:
+        try: requests.post(f"{API_URL}/etl/cancel/{json.loads(ctx.triggered[0]['prop_id'].split('.')[0])['index']}", headers=get_auth_header(token))
+        except: pass
+    return no_update
+
+# --- WEBSOCKET LISTENER ---
+@app.callback(Output('task-queue-container', 'children'), Input('ws', 'message'))
+def update_queue(msg):
+    if not msg or not msg['data']: return no_update
+    tasks = json.loads(msg['data'])
+    children = []
+    for task in sorted(tasks, key=lambda x: x.get('state') == 'PENDING', reverse=True):
+        st, pr = task.get('state', 'PENDING'), task.get('progress', 0)
+        color = "warning" if st == 'PENDING' else "info" if st in ['RUNNING', 'PROGRESS'] else "success" if st == 'SUCCESS' else "danger"
+        animated = st in ['PENDING', 'RUNNING', 'PROGRESS']
+        cancel_btn = dbc.Button("✖", id={'type': 'cancel-btn', 'index': task['id']}, color="link", n_clicks=0, className="text-danger p-0 ms-2 text-decoration-none fw-bold") if animated else None
+        
+        children.append(dbc.Card([
+            dbc.CardBody([
+                dbc.Row([
+                    dbc.Col([html.Strong(task['ticker']), html.Span(f" ({st})", className="ms-2 small text-muted")], width=3),
+                    dbc.Col(
+                        dbc.Progress(value=pr, label=f"{pr}%", color=color, striped=animated, animated=animated, style={"height": "20px"}, className="w-100"), 
+                        width=5, className="d-flex align-items-center"
+                    ),
+                    dbc.Col(html.Small(task.get('status', '')), width=3, className="text-end text-truncate"),
+                    dbc.Col(cancel_btn, width=1, className="text-end")
+                ], align="center", className="g-0")
+            ])
+        ], className="mb-2 bg-dark border-secondary p-0"))
+        if len(children) >= 5: break
+    return children
+
+# 3. DATA & AUTO REFRESH
+# Обновляем выпадающий список тикеров, когда приходит сообщение от WebSocket (задача завершилась)
+@app.callback(Output('ticker-dropdown', 'options'), [Input('refresh-btn', 'n_clicks'), Input('ws', 'message'), Input('url', 'pathname')])
+def update_dd(n, msg, p): return [{'label': t, 'value': t} for t in fetch_tickers()]
+
+# Остальные колбэки (графики, песочница) без изменений
+@app.callback([Output('interval-selector', 'options'), Output('interval-selector', 'value')], [Input('ticker-dropdown', 'value')], [State('interval-selector', 'value')])
+def update_int(t, v):
+    d = [{"label": "Daily", "value": "1d", "disabled": True}, {"label": "Minute", "value": "1m", "disabled": True}]
+    if not t: return d, "1d"
+    try:
+        a = requests.get(f"{API_URL}/availability/{t}").json()
+        opts = [{"label": "Daily", "value": "1d", "disabled": not a.get('1d')}, {"label": "Minute", "value": "1m", "disabled": not a.get('1m')}]
+        val = v if a.get(v) else ('1d' if a.get('1d') else '1m')
+        return opts, val
+    except: return d, "1d"
+
+@app.callback(Output('main-chart', 'figure'), [Input('ticker-dropdown', 'value'), Input('interval-selector', 'value')])
+def main_chart(t, i):
+    empty = go.Figure(layout=go.Layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', xaxis={'visible': False}, yaxis={'visible': False}))
+    if not t: return empty
+    try:
+        d = requests.get(f"{API_URL}/metrics/{t}?interval={i}").json()
+        df = pd.DataFrame(d)
+        df['ts'] = pd.to_datetime(df['ts'])
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.6, 0.2, 0.2])
+        fig.add_trace(go.Candlestick(x=df['ts'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='OHLC'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['ts'], y=df['sma_20'], line=dict(color='yellow'), name='SMA20'), row=1, col=1)
+        fig.add_trace(go.Bar(x=df['ts'], y=df['volume'], marker_color='teal', name='Vol'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df['ts'], y=df['rsi_14'], line=dict(color='purple'), name='RSI'), row=3, col=1)
+        fig.update_layout(template="plotly_dark", xaxis_rangeslider_visible=False, paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)', margin=dict(l=40, r=40, t=10, b=10), height=600)
+        return fig
+    except: return empty
+
+@app.callback(Output("download-raw-csv", "data"), Input("btn-download-raw", "n_clicks"), [State('ticker-dropdown', 'value'), State('interval-selector', 'value')], prevent_initial_call=True)
+def download_raw_csv(n, ticker, interval):
+    if not ticker: return no_update
+    try:
+        url = f"{API_URL}/metrics/{ticker}?interval={interval}"
+        df = pd.DataFrame(requests.get(url).json())
+        return dcc.send_data_frame(df.to_csv, f"{ticker}_{interval}_raw.csv", index=False)
+    except: return no_update
+
+@app.callback(Output('my-charts-dropdown', 'options'), [Input('url', 'pathname'), Input('save-chart-btn', 'n_clicks')], State('auth-token', 'data'))
+def update_my_charts(p, n, token):
+    if not token: return []
+    try:
+        resp = requests.get(f"{API_URL}/charts", headers=get_auth_header(token))
+        if resp.status_code == 200: return [{'label': c['name'], 'value': c['code']} for c in resp.json()]
+    except: pass
+    return []
+
+@app.callback(Output('code-editor', 'value', allow_duplicate=True), [Input('preset-dropdown', 'value'), Input('my-charts-dropdown', 'value')], prevent_initial_call=True)
+def load_code(preset, chart_code):
+    ctx = callback_context
+    if not ctx.triggered: return no_update
+    trigger_id = ctx.triggered[0]['prop_id']
+    if 'preset' in trigger_id and preset: return PRESETS[preset]['code']
+    if 'my-charts' in trigger_id and chart_code: return chart_code
+    return no_update
+
+@app.callback(Output('save-chart-btn', 'children'), Input('save-chart-btn', 'n_clicks'), [State('save-chart-name', 'value'), State('code-editor', 'value'), State('auth-token', 'data')], prevent_initial_call=True)
+def save_chart_action(n, name, code, token):
+    if not name or not token: return "💾 Save"
+    try:
+        requests.post(f"{API_URL}/charts", json={"name": name, "code": code}, headers=get_auth_header(token))
+        return "✅ Saved!"
+    except: return "❌ Error"
+
+@app.callback([Output('custom-chart', 'figure'), Output('code-error-output', 'children'), Output('dataset-info', 'children'), Output('data-preview', 'children'), Output('sandbox-data-store', 'data')], [Input('run-code-btn', 'n_clicks')], [State('code-editor', 'value'), State('ticker-dropdown', 'value'), State('interval-selector', 'value')], prevent_initial_call=True)
+def run_custom_code(n, code, ticker, interval):
+    empty = go.Figure(layout=go.Layout(template="plotly_dark", paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)'))
+    if not ticker: return empty, dbc.Alert("⚠️ Please select a ticker first.", color="warning"), "No Data", "", None
+    try:
+        resp = requests.get(f"{API_URL}/metrics/{ticker}?interval={interval}")
+        data = resp.json()
+        if not data: return empty, dbc.Alert(f"❌ No data for {ticker}.", color="danger"), "0 rows", "", None
+        df = pd.DataFrame(data)
+        df['ts'] = pd.to_datetime(df['ts'])
+        for c in ['open', 'close', 'high', 'low', 'volume', 'sma_20', 'rsi_14']: df[c] = pd.to_numeric(df[c], errors='coerce')
+        local_env = {'df': df, 'pd': pd, 'go': go, 'px': px, 'make_subplots': make_subplots}
+        exec(code, {}, local_env)
+        if 'custom_plot' not in local_env: return empty, dbc.Alert("Error: Function 'custom_plot' missing.", color="danger"), "", "", None
+        fig = local_env['custom_plot'](df)
+        fig.update_layout(paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)')
+        info_str = f"{len(df)} rows | {len(df.columns)} cols"
+        preview_table = dbc.Table.from_dataframe(df.head(3), striped=True, bordered=True, hover=True, size='sm', color='dark')
+        json_data = df.to_json(date_format='iso', orient='split')
+        return fig, "", info_str, preview_table, json_data
+    except Exception: return empty, dbc.Alert(html.Pre(traceback.format_exc()), color="danger"), "Error", "", None
+
+@app.callback(Output("download-sandbox-csv", "data"), Input("btn-download-sandbox", "n_clicks"), [State('sandbox-data-store', 'data'), State('ticker-dropdown', 'value')], prevent_initial_call=True)
+def download_sandbox_csv(n, json_data, ticker):
+    if not json_data: return no_update
+    try:
+        df = pd.read_json(json_data, orient='split')
+        return dcc.send_data_frame(df.to_csv, f"{ticker}_analysis_result.csv", index=False)
+    except: return no_update
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8050, debug=True)
+</file>
+
+<file path="src/ingestion/moex.py">
+# File: src/ingestion/moex.py
+import requests
+import time
+import json
+import random
+import calendar  # <--- НОВОЕ: Для работы с датами месяца
+import dask
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from src.storage.minio_client import minio_client
+
+# Константы API
+BASE_URL_SHARES = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities/{ticker}/candles.json"
+BASE_URL_INDEX = "https://iss.moex.com/iss/engines/stock/markets/index/boards/SNDX/securities/{ticker}/candles.json"
+
+def get_robust_session():
+    session = requests.Session()
+    retry = Retry(
+        total=5,
+        read=5, 
+        connect=5, 
+        backoff_factor=2, 
+        status_forcelist=[429, 500, 502, 503, 504],
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (DataEngineer Student Project)' 
+    })
+    return session
+
+def download_chunk(ticker: str, year: int, interval: int, month: int = None, is_index: bool = False) -> str:
+    """
+    Скачивает данные. 
+    Если передан month, качает только этот месяц и сохраняет в подпапку.
+    """
+    base_url = BASE_URL_INDEX if is_index else BASE_URL_SHARES
+    base_url = base_url.format(ticker=ticker)
+    
+    interval_name = "1m" if interval == 1 else "1d"
+    
+    # --- ЛОГИКА ДАТ И ПУТЕЙ ---
+    if month:
+        # Если качаем месяц: SBER/1m/2024/01.json
+        _, last_day = calendar.monthrange(year, month)
+        start_date = f"{year}-{month:02d}-01"
+        end_date = f"{year}-{month:02d}-{last_day}"
+        s3_path = f"{ticker}/{interval_name}/{year}/{month:02d}.json"
+        log_prefix = f"{ticker} {year}-{month:02d}"
+    else:
+        # Если качаем год (для дневок): SBER/1d/2024.json
+        start_date = f"{year}-01-01"
+        end_date = f"{year}-12-31"
+        s3_path = f"{ticker}/{interval_name}/{year}.json"
+        log_prefix = f"{ticker} {year}"
+
+    # Проверка наличия (Идемпотентность)
+    if minio_client.exists(s3_path):
+        return f"SKIP: {log_prefix} (Exists)"
+
+    all_data = []
+    start_index = 0
+    session = get_robust_session()
+
+    # print(f"🔄 START: {log_prefix} | {start_date} -> {end_date}")
+
+    while True:
+        params = {
+            "from": start_date,
+            "till": end_date,
+            "start": start_index,
+            "interval": interval
+        }
+        
+        try:
+            resp = session.get(base_url, params=params, timeout=20)
+            
+            if resp.status_code != 200:
+                print(f"❌ HTTP {resp.status_code} on {log_prefix}")
+                break
+                
+            data = resp.json()
+            if 'candles' not in data:
+                break
+                
+            rows = data['candles']['data']
+            columns = data['candles']['columns']
+            
+            if not rows:
+                break
+                
+            for row in rows:
+                record = dict(zip(columns, row))
+                all_data.append(record)
+            
+            # Если вернулось < 500, значит конец данных
+            if len(rows) < 500:
+                break
+                
+            start_index += len(rows)
+            
+            # Пауза, чтобы не дудосить (Jitter)
+            time.sleep(0.3 + random.uniform(0.1, 0.3))
+            
+        except Exception as e:
+            print(f"❌ Error on {log_prefix}: {e}")
+            time.sleep(5) # Длинная пауза при ошибке
+            break
+
+    if all_data:
+        # Сортировка по времени
+        all_data.sort(key=lambda x: x.get('begin', ''))
+        minio_client.save_json(all_data, s3_path)
+        return f"SUCCESS: {log_prefix} ({len(all_data)} rows)"
+    
+    # Если данных нет (например, будущий месяц), не создаем файл
+    return f"EMPTY: {log_prefix}"
+
+@dask.delayed
+def process_ticker_year(ticker: str, year: int, interval: int, month: int, is_index: bool):
+    # Dask обертка теперь принимает month
+    return download_chunk(ticker, year, interval, month, is_index)
+</file>
+
+<file path="src/processing/spark_job.py">
+# File: src/processing/spark_job.py
+import uuid
+import socket
+import psycopg2
+from typing import List
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import StructType, StructField, StringType, DoubleType
+from src.config import settings
+
+def get_spark_session(app_name: str = "MOEX_ETL_Strict"):
+    container_ip = socket.gethostbyname(socket.gethostname())
+    return (SparkSession.builder
+        .appName(app_name)
+        .master(settings.SPARK_MASTER_URL)
+        .config("spark.sql.ansi.enabled", "false")
+        .config("spark.hadoop.fs.s3a.endpoint", settings.MINIO_ENDPOINT)
+        .config("spark.hadoop.fs.s3a.access.key", settings.MINIO_ACCESS_KEY)
+        .config("spark.hadoop.fs.s3a.secret.key", settings.MINIO_SECRET_KEY)
+        .config("spark.hadoop.fs.s3a.path.style.access", "true")
+        .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
+        .config("spark.hadoop.fs.s3a.connection.ssl.enabled", "false")
+        # Optimization & Memory
+        .config("spark.driver.memory", "1g") 
+        .config("spark.executor.memory", "1g")
+        .config("spark.driver.bindAddress", "0.0.0.0")
+        .config("spark.driver.host", container_ip)
+        .getOrCreate())
+
+def get_pg_connection():
+    return psycopg2.connect(
+        host=settings.POSTGRES_HOST, port=settings.POSTGRES_PORT,
+        user=settings.POSTGRES_USER, password=settings.POSTGRES_PASSWORD,
+        dbname=settings.POSTGRES_DB
+    )
+
+def process_bronze_to_silver(spark, target_tickers: List[str] = None):
+    print(f"🚀 [STAGE 1] Bronze -> Silver (Targets: {target_tickers or 'ALL'})")
+    raw_path_root = f"s3a://{settings.MINIO_BUCKET_RAW}"
+    silver_path = f"s3a://{settings.MINIO_BUCKET_SILVER}/market_data"
+
+    schema = StructType([
+        StructField("begin", StringType(), True),
+        StructField("open", DoubleType(), True),
+        StructField("close", DoubleType(), True),
+        StructField("high", DoubleType(), True),
+        StructField("low", DoubleType(), True),
+        StructField("volume", DoubleType(), True),
+        StructField("value", DoubleType(), True), 
+        StructField("end", StringType(), True)
+    ])
+
+    try:
+        df = spark.read.format("json") \
+            .schema(schema) \
+            .option("recursiveFileLookup", "true") \
+            .option("pathGlobFilter", "*.json") \
+            .load(raw_path_root)
+
+        df = df.withColumn("file_path", F.input_file_name())
+        df = df.withColumn("ticker", F.regexp_extract(F.col("file_path"), r"\/([A-Z0-9]{3,6})\/(1[dm])\/", 1))
+        df = df.withColumn("interval_type", F.regexp_extract(F.col("file_path"), r"\/([A-Z0-9]{3,6})\/(1[dm])\/", 2))
+
+        if target_tickers:
+            df = df.filter(F.col("ticker").isin(target_tickers))
+
+        if df.rdd.isEmpty():
+            print("⚠️ [Bronze->Silver] No data found.")
+            return
+
+        df_clean = df.select(
+            F.col("ticker"),
+            F.col("interval_type").alias("interval"),
+            F.to_timestamp(F.col("begin")).alias("ts"),
+            F.col("open"),
+            F.col("high"),
+            F.col("low"),
+            F.col("close"),
+            F.col("volume")
+        ).dropna(subset=["ticker", "interval", "ts", "close"]) \
+         .dropDuplicates(["ticker", "interval", "ts"])
+
+        spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
+        print("💾 Saving to Silver Layer (Parquet)...")
+        df_clean.write.mode("overwrite").partitionBy("ticker").parquet(silver_path)
+        print("✅ Silver Layer Updated.")
+
+    except Exception as e:
+        print(f"❌ Error in Bronze->Silver: {e}")
+        raise e
+
+def process_silver_to_gold_atomic(spark, target_tickers: List[str] = None):
+    print(f"🚀 [STAGE 2] Silver -> Gold (Atomic Swap) Targets: {target_tickers or 'ALL'}")
+    silver_path = f"s3a://{settings.MINIO_BUCKET_SILVER}/market_data"
+    
+    try:
+        df = spark.read.parquet(silver_path)
+        
+        if target_tickers:
+            df = df.filter(F.col("ticker").isin(target_tickers))
+        
+        if df.rdd.isEmpty():
+            print("⚠️ [Silver->Gold] No data found.")
+            return
+
+        # --- Calculations ---
+        w = Window.partitionBy("ticker", "interval").orderBy("ts")
+        df_indicators = df.withColumn("sma_20", F.avg("close").over(w.rowsBetween(-19, 0)))
+        
+        change = F.col("close") - F.lag("close", 1).over(w)
+        gain = F.when(change > 0, change).otherwise(0)
+        loss = F.when(change < 0, F.abs(change)).otherwise(0)
+        avg_gain = F.avg(gain).over(w.rowsBetween(-13, 0))
+        avg_loss = F.avg(loss).over(w.rowsBetween(-13, 0))
+        rs = avg_gain / avg_loss
+        rsi_calc = 100 - (100 / (1 + rs))
+        rsi_safe = F.when(avg_loss == 0, 100.0).otherwise(rsi_calc)
+        
+        df_final = df_indicators.withColumn("rsi_14", F.coalesce(rsi_safe, F.lit(50.0)))
+        
+        # --- FIX: Convert Timestamp to String for Safe Transport ---
+        # Postgres can cast string '2024-01-01 10:00:00' to Timestamp easily.
+        # But it cannot cast Double (Epoch) to Timestamp implicitly.
+        df_final = df_final.withColumn("ts_str", F.date_format(F.col("ts"), "yyyy-MM-dd HH:mm:ss"))
+        # Drop original ts object to avoid confusion in JDBC
+        df_final = df_final.drop("ts")
+
+        row_count = df_final.count()
+        print(f"✅ Calculated {row_count} rows.")
+        if row_count == 0: return
+
+        # --- STAGING WRITE ---
+        run_id = str(uuid.uuid4()).replace("-", "")[:8]
+        temp_table = f"temp_metrics_{run_id}"
+        
+        jdbc_url = f"jdbc:postgresql://{settings.POSTGRES_HOST}:{settings.POSTGRES_PORT}/{settings.POSTGRES_DB}"
+        props = {"user": settings.POSTGRES_USER, "password": settings.POSTGRES_PASSWORD, "driver": "org.postgresql.Driver"}
+
+        print(f"💾 Writing to STAGING table: {temp_table}...")
+        df_final.write.jdbc(url=jdbc_url, table=temp_table, mode="overwrite", properties=props)
+        
+        # --- ATOMIC MERGE ---
+        print("🔄 Performing ATOMIC MERGE in Postgres...")
+        conn = get_pg_connection()
+        try:
+            with conn.cursor() as cur:
+                # 1. Start Transaction
+                # Удаляем старые данные для этих тикеров
+                if target_tickers:
+                    cur.execute(f"DELETE FROM stock_metrics WHERE ticker = ANY(%s)", (target_tickers,))
+                else:
+                    cur.execute("TRUNCATE TABLE stock_metrics") # Full refresh case
+                
+                # 2. Insert from Temp with EXPLICIT CASTING
+                # Мы берем строку ts_str и кастуем её в timestamp: ts_str::timestamp
+                insert_query = f"""
+                    INSERT INTO stock_metrics 
+                    (ticker, interval, ts, open, high, low, close, volume, sma_20, rsi_14)
+                    SELECT 
+                        ticker, 
+                        interval, 
+                        ts_str::timestamp as ts, 
+                        open, 
+                        high, 
+                        low, 
+                        close, 
+                        volume, 
+                        sma_20, 
+                        rsi_14 
+                    FROM {temp_table}
+                """
+                cur.execute(insert_query)
+                
+                # 3. Cleanup
+                cur.execute(f"DROP TABLE {temp_table}")
+                
+                conn.commit()
+                print("✅ ATOMIC SWAP COMPLETED SUCCESSFULLY.")
+                
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ Transaction FAILED. Rollback executed. Error: {e}")
+            # Try to cleanup garbage
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(f"DROP TABLE IF EXISTS {temp_table}")
+                    conn.commit()
+            except: pass
+            raise e
+        finally:
+            conn.close()
+
+    except Exception as e:
+        print(f"❌ Error in Silver->Gold: {e}")
+        raise e
+
+def process_data(tickers: List[str] = None):
+    spark = get_spark_session()
+    try:
+        process_bronze_to_silver(spark, tickers)
+        process_silver_to_gold_atomic(spark, tickers)
+    finally:
+        spark.stop()
+
+if __name__ == "__main__":
+    process_data(["SBER"])
+</file>
+
+<file path="src/storage/minio_client.py">
+# File: src/storage/minio_client.py
+import json
+import s3fs
+from src.config import settings
+
+class MinioClient:
+    def __init__(self):
+        self.fs = s3fs.S3FileSystem(
+            key=settings.MINIO_ACCESS_KEY,
+            secret=settings.MINIO_SECRET_KEY,
+            client_kwargs={'endpoint_url': settings.MINIO_ENDPOINT},
+            use_listings_cache=False
+        )
+        # Инициализируем оба слоя
+        self._ensure_bucket(settings.MINIO_BUCKET_RAW)
+        self._ensure_bucket(settings.MINIO_BUCKET_SILVER)
+
+    def _ensure_bucket(self, bucket_name: str):
+        if not self.fs.exists(bucket_name):
+            try:
+                self.fs.mkdir(bucket_name)
+            except Exception:
+                pass 
+
+    def save_json(self, data: list, path: str):
+        full_path = f"{settings.MINIO_BUCKET_RAW}/{path}"
+        with self.fs.open(full_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False)
+    
+    def exists(self, path: str) -> bool:
+        full_path = f"{settings.MINIO_BUCKET_RAW}/{path}"
+        return self.fs.exists(full_path)
+
+    def list_downloaded_tickers(self) -> list:
+        try:
+            paths = self.fs.ls(settings.MINIO_BUCKET_RAW, detail=False)
+            tickers = []
+            for p in paths:
+                name = p.split('/')[-1]
+                if name.isupper() and len(name) >= 3:
+                    tickers.append(name)
+            return sorted(tickers)
+        except Exception as e:
+            print(f"Error listing MinIO: {e}")
+            return []
+
+minio_client = MinioClient()
+</file>
+
+<file path="src/storage/task_registry.py">
+# File: src/storage/task_registry.py
+import redis
+import json
+import os
+
+
+class TaskRegistry:
+    def __init__(self):
+        # Подключаемся к тому же Redis, что и Celery
+        redis_url = os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0")
+        self.redis = redis.from_url(redis_url)
+        self.KEY = "moex:tasks:registry"
+
+    def add_task(self, task_id: str, ticker: str):
+        """Регистрируем новую задачу"""
+        data = {"id": task_id, "ticker": ticker, "progress": 0, "status": "Queued", "state": "PENDING"}
+        self.save_task(task_id, data)
+
+    def update_task(self, task_id: str, progress: int = None, status: str = None, state: str = None):
+        """Обновляем статус"""
+        data = self.get_task(task_id)
+        if not data:
+            return
+
+        if progress is not None:
+            data["progress"] = progress
+        if status:
+            data["status"] = status
+        if state:
+            data["state"] = state
+
+        self.save_task(task_id, data)
+
+    def save_task(self, task_id: str, data: dict):
+        self.redis.hset(self.KEY, task_id, json.dumps(data))
+
+    def get_task(self, task_id: str):
+        raw = self.redis.hget(self.KEY, task_id)
+        return json.loads(raw) if raw else None
+
+    def get_all_tasks(self):
+        """Возвращает список всех задач"""
+        raw_map = self.redis.hgetall(self.KEY)
+        tasks = [json.loads(v) for v in raw_map.values()]
+        # Сортируем: сначала активные, потом завершенные
+        return sorted(tasks, key=lambda x: x["state"] == "PENDING", reverse=True)
+
+    def delete_task(self, task_id: str):
+        self.redis.hdel(self.KEY, task_id)
+
+
+task_registry = TaskRegistry()
+</file>
+
+<file path="src/worker/tasks.py">
+# File: src/worker/tasks.py
+from celery import Celery
+import os
+import time
+import requests
+from flows.ingest_flow import ingest_flow
+from flows.transform_flow import transform_flow
+from src.storage.task_registry import task_registry
+
+celery_app = Celery(
+    "moex_worker",
+    broker=os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"),
+    backend=os.getenv("CELERY_RESULT_BACKEND", "redis://redis:6379/0"),
+)
+# ВАЖНО: Возвращаем "fork" или "prefork", чтобы работала параллельность, 
+# НО для Spark внутри контейнера безопаснее "threads" или "solo", если мало памяти.
+# С новой логикой (append) можно попробовать "threads".
+celery_app.conf.worker_pool = "threads" 
+celery_app.conf.worker_concurrency = 4  # 4 одновременных задачи
+
+def wait_for_prefect(api_url: str, timeout: int = 60):
+    start_time = time.time()
+    health_url = f"{api_url.rstrip('/api')}/health"
+    while True:
+        try:
+            if requests.get(health_url, timeout=2).status_code == 200: return True
+        except: pass
+        if time.time() - start_time > timeout: return False
+        time.sleep(2)
+
+@celery_app.task(bind=True)
+def run_etl_task(self, tickers: list, years_back: int):
+    task_id = self.request.id
+    print(f"👷 Worker picked up task {task_id} for {tickers}")
+    task_registry.update_task(task_id, progress=1, status="🚀 Initializing...", state="RUNNING")
+    
+    prefect_url = os.getenv("PREFECT_API_URL", "http://prefect-server:4200/api")
+    if not wait_for_prefect(prefect_url):
+        task_registry.update_task(task_id, progress=100, status="❌ Prefect Timeout", state="FAILURE")
+        return
+
+    try:
+        # 1. Ingestion
+        ingest_flow(tickers, years_back, task_id=task_id)
+
+        # 2. Processing (Только для этих тикеров!)
+        task_registry.update_task(task_id, progress=75, status="🔥 Processing (Spark)...", state="RUNNING")
+        transform_flow(tickers) # <-- Передаем список тикеров
+
+        # 3. Done
+        task_registry.update_task(task_id, progress=100, status="✅ Completed", state="SUCCESS")
+        return "OK"
+    except Exception as e:
+        print(f"❌ Task failed: {e}")
+        task_registry.update_task(task_id, progress=100, status=f"Error: {str(e)[:20]}", state="FAILURE")
+        raise e
+</file>
+
+<file path="start.sh">
+#!/bin/bash
+
+echo "🚀 Starting System with MULTIPLE ISOLATED Workers..."
+
+# Worker 1 (Обрабатывает задачи по одной, полностью изолирован)
+# Очереди берет любые
+nohup celery -A src.worker.tasks worker --loglevel=info --pool=solo -n worker1 > worker1.log 2>&1 &
+
+# Worker 2 (Тоже изолирован, работает параллельно с первым)
+nohup celery -A src.worker.tasks worker --loglevel=info --pool=solo -n worker2 > worker2.log 2>&1 &
+
+# Хочешь еще больше мощности? Раскомментируй третьего:
+# nohup celery -A src.worker.tasks worker --loglevel=info --pool=solo -n worker3 > worker3.log 2>&1 &
+
+echo "🔌 Starting API..."
+nohup uvicorn src.api.app:app --host 0.0.0.0 --port 8000 > api.log 2>&1 &
+
+echo "⏳ Waiting for services..."
+sleep 5
+
+
+echo "🎨 Starting UI..."
+python src/dashboard/app.py
+</file>
+
+<file path="tests/test_injection.py">
+# File: tests/test_ingestion.py
+import pytest
+from unittest.mock import patch, MagicMock
+from src.ingestion.moex import download_chunk
+from src.config import settings
+
+# Фиктивные данные для теста
+MOCK_RESPONSE_DATA = {
+    "candles": {
+        "columns": ["begin", "open", "close", "high", "low", "volume", "value", "end"],
+        "data": [
+            ["2023-01-01 10:00:00", 100, 105, 110, 99, 5000, 525000, "2023-01-01 10:01:00"],
+            ["2023-01-01 10:01:00", 105, 102, 106, 101, 3000, 310000, "2023-01-01 10:02:00"],
+        ],
+    }
+}
+
+
+class TestMoexIngestion:
+    @patch("src.ingestion.moex.minio_client")
+    @patch("src.ingestion.moex.requests.get")
+    def test_download_chunk_success(self, mock_get, mock_minio):
+        """
+        Тест успешной загрузки данных:
+        1. Эмулируем ответ API (200 OK + JSON).
+        2. Эмулируем отсутствие файла в MinIO (чтобы загрузка началась).
+        3. Проверяем, что minio_client.save_json был вызван.
+        """
+        # Настройка моков
+        mock_minio.exists.return_value = False
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = MOCK_RESPONSE_DATA
+        # requests.get будет возвращать наш фиктивный ответ
+        mock_get.return_value = mock_response
+
+        # Запуск функции
+        result = download_chunk("TEST_TICKER", 2023, 24)
+
+        # Проверки
+        assert "SUCCESS" in result
+        assert "2 rows" in result
+
+        # Проверяем, что сохранение было вызвано 1 раз
+        mock_minio.save_json.assert_called_once()
+
+        # Проверяем аргументы сохранения (правильность пути)
+        args, _ = mock_minio.save_json.call_args
+        data_arg, path_arg = args
+        assert len(data_arg) == 2
+        assert path_arg == "TEST_TICKER/1d/2023.json"
+
+    @patch("src.ingestion.moex.minio_client")
+    def test_skip_existing(self, mock_minio):
+        """
+        Тест пропуска, если файл уже есть в MinIO.
+        """
+        mock_minio.exists.return_value = True
+
+        result = download_chunk("SBER", 2023, 24)
+
+        assert "SKIP" in result
+        mock_minio.save_json.assert_not_called()
+
+    @patch("src.ingestion.moex.minio_client")
+    @patch("src.ingestion.moex.requests.get")
+    def test_api_error_handling(self, mock_get, mock_minio):
+        """
+        Тест обработки 404 или 500 ошибки от API.
+        """
+        mock_minio.exists.return_value = False
+
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.text = "Internal Server Error"
+        mock_response.url = "http://moex.com/..."
+        mock_get.return_value = mock_response
+
+        result = download_chunk("BROKEN_TICKER", 2023, 24)
+
+        assert "EMPTY" in result
+        mock_minio.save_json.assert_not_called()
+</file>
+
+</files>
